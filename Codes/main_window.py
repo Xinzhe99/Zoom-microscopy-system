@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 # @Author  : XinZhe Xie
 # @University  : ZheJiang University
-import PySpin
-from PyQt5.QtGui import QImage, QPixmap, QIcon, QPainter, QPen
-import os
-from PyQt5.QtCore import QTimer, QThread, Qt, QRect
-from PyQt5.QtWidgets import QFileDialog, QMessageBox, QInputDialog, QLabel
-from tools import is_number,cal_clarity,max_y
 
+import re
+import PySpin
+from PyQt5.QtGui import QImage, QPixmap, QIcon
+import os
+from PyQt5.QtCore import QTimer, QThread, Qt, QRect, pyqtSignal
+from PyQt5.QtWidgets import QFileDialog, QMessageBox, QInputDialog
+from tools import is_number,cal_clarity,max_y,is_scale_valid
 import cv2
 from lens import Lens
 from PyQt5.QtWidgets import QApplication, QWidget
@@ -17,6 +18,8 @@ from PyQt5 import uic
 import numpy as np
 from scipy.optimize import curve_fit
 import serial.tools.list_ports
+import fusion
+from torch.cuda import is_available as gpu_is_available
 
 #允许多个进程同时使用OpenMP库
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -31,6 +34,10 @@ diop_updata_flag=10000
 
 #局部对焦flag
 roi_flag=False
+
+#相机是否开了flag
+flag_cam_is_on = False
+
 
 
 class MyWindow(QWidget):
@@ -50,10 +57,13 @@ class MyWindow(QWidget):
             ico_path = 'myico.ico'
         self.ui.setWindowIcon(QIcon(ico_path))
 
+        #一开始没有连接任何串口
+        self.port_checked=''
+
         #启动按钮
         btn_start_capture=self.ui.btn_begin_caputre #获取相机画面按钮
         btn_start_capture.clicked.connect(self.start_capture)
-        
+
         #停止按钮
         btn_stop_capture=self.ui.btn_stop_caputre#停止获取画面的按钮
         btn_stop_capture.clicked.connect(self.stop_capture)
@@ -86,6 +96,9 @@ class MyWindow(QWidget):
         # 显示相机数量的标签
         self.lb_num_cam = self.ui.video_num
 
+        #获取显示lable的width和height
+        self.show_width = self.ui.video_label.geometry().width()
+        self.show_height = self.ui.video_label.geometry().height()
         # 绑定自动曝光按钮
         self.btn_auto_exposure=self.ui.btn_Auto_Exposure
         # 自动曝光初始化默认开启
@@ -132,6 +145,10 @@ class MyWindow(QWidget):
         #连接透镜按钮
         self.btn_connect_lens=self.ui.btn_begin_connect_len
         self.btn_connect_lens.clicked.connect(self.create_len)
+
+        # 连接透镜串口刷新按钮
+        self.btn_connect_lens = self.ui.btn_com_refresh
+        self.btn_connect_lens.clicked.connect(self.refresh_ports)
 
         #设置屈光度按钮
         self.btn_to_set_diopter=self.ui.btn_set_diopter
@@ -234,25 +251,85 @@ class MyWindow(QWidget):
         # 鼠标移动中Flag,防止两个鼠标事件起冲突，效果和过滤器差不多
         self.move_flag = False
 
+        # 创建一个QTimer对象来检测串口
+        self.timer_port = QTimer()
+        # 连接定时器的timeout信号
+        self.timer_port.timeout.connect(self.check_port_status)
+
+        #绑定自动搜寻按钮
+        self.ui.btn_autoSearch.clicked.connect(self.auto_search)
+        self.ui.btn_autoSearch.setEnabled(False)
+        self.cal_auto_search = False
+        self.frame_list_cal=[]
+
+        #绑定融合图像栈的按钮
+        self.btn_fusion = self.ui.btn_fusion_stack
+        self.btn_fusion.clicked.connect(self.fusion_stack)
+
+        # 绑定选择融合图像栈路径的按钮
+        self.btn_stack_path = self.ui.btn_stack_path
+        self.btn_stack_path.clicked.connect(self.browse_stack_dir)
+
+        # 绑定选择融合图像栈融合结果保存路径的按钮
+        self.btn_save_result_path = self.ui.btn_save_result_path
+        self.btn_save_result_path.clicked.connect(self.browse_fusion_result_dir)
+
+        #检查gpu是否可以用
+        if gpu_is_available():
+            self.ui.btn_use_GPU.setChecked(True)
+        else:
+            self.ui.btn_use_GPU.setChecked(False)
+
+        #自动对焦时候所用的计算清晰度的计算时间宏定义(s)
+        self.cal_sleep=1
+
+        #一开始不可以用自动对焦，连上相机和透镜才可以
+        self.ui.btn_autofocus.setEnabled(False)
+
     #获取端口列表
     def get_port_list(self):
         plist = list(serial.tools.list_ports.comports())
-
         if len(plist) <= 0:
             QMessageBox.information(self, 'Notice', 'Cannot find any com can be used!')
-
         else:
             self.ui.comboBox_port.clear()
             for i in range(0, len(plist)):
                 self.plist_0 = list(plist[i])
                 self.ui.comboBox_port.addItem(str(self.plist_0[0]))
-
+    # 检测连接函数
+    def check_port_status(self):
+        #每隔一秒钟获取一次port列表
+        plist = list(serial.tools.list_ports.comports())
+        port_list=[]
+        for i in range(0, len(plist)):
+            plist_0 = list(plist[i])
+            port_list.append(str(plist_0[0]))
+        #串口拔出了
+        if not self.port_checked in port_list:
+            QMessageBox.information(self, 'Notice', 'Lens connection disconnected!')
+            self.ui.lb_show_com.setText('Not connected')
+            self.ui.lb_temp_show.setText('')
+            self.ui.lb_firmware_show.setText('')
+            self.ui.lb_posi_dip_show.setText('')
+            self.ui.lb_neg_dip_show.setText('')
+            self.ui.lb_lens_SN_show.setText('')
+            self.refresh_ports()
+            self.timer_port.stop()
+        else:
+            self.ui.lb_show_com.setText('Connected')
+    #刷新串口列表
+    def refresh_ports(self):
+        self.lens.close_connection()
+        self.ui.btn_autoSearch.setEnabled(False)
+        self.get_port_list()
+        self.port_checked = ''
     # 用于手动设置编辑框输入的曝光值
     def set_exposure_edit(self):
         exp_to_set_text = self.exp_edit.text()
         if is_number(exp_to_set_text):
             exp_to_set=float(exp_to_set_text)
             self.cam.ExposureTime.SetValue(exp_to_set)
+            self.exposure_time_slider.setValue(exp_to_set)
         else:
             QMessageBox.information(self, "notice", 'Please enter exposure value')
 
@@ -262,6 +339,7 @@ class MyWindow(QWidget):
         if is_number(gain_to_set_text):
             gain_to_set = float(gain_to_set_text)
             self.cam.Gain.SetValue(gain_to_set)
+            self.gain_slider.setValue(gain_to_set)
         else:
             QMessageBox.information(self, "notice", 'Please enter gain value')
 
@@ -269,96 +347,110 @@ class MyWindow(QWidget):
     #用于初始化相机并且开启定时器捕获图像
     def start_capture(self):
         try:
+
             self.camera_system = PySpin.System.GetInstance()
             self.cam_list = self.camera_system.GetCameras()
             self.cam = self.cam_list[0]
-            self.nodemap_tldevice = self.cam.GetTLDeviceNodeMap()#
-            self.sNodemap = self.cam.GetTLStreamNodeMap()#获取传输层流节点映射,传输层流是指相机和主机之间的数据流，它可以通过不同的传输协议来实现
-            self.nodemap = self.cam.GetNodeMap()
-        except Exception as e:
-            # 输出异常信息
-            print(e)
-        # 获取相机数量,这里只支持一个!
-        num_cameras = self.cam_list.GetSize()
-        if num_cameras!=0:
-            # 获取相机版本型号
-            cam_version = self.camera_system.GetLibraryVersion()
-            self.lb_video_inf.setText('Library version: %d.%d.%d.%d' % (
-                cam_version.major, cam_version.minor, cam_version.type, cam_version.build))
-            # 相机初始化
-            self.cam.Init()
-            # 使能按钮
-            self.btn_save_pictures.setEnabled(True)
-            self.btn_stop_save_pictures.setEnabled(True)
-            self.btn_auto_exposure.setEnabled(True)
-            self.btn_auto_gain.setEnabled(True)
-            self.ui.btn_stop_caputre.setEnabled(True)
-            self.lb_num_cam.setText('%d' % num_cameras)
-            self.btn_stop_capture_video.setEnabled(False)
-            self.btn_start_capture_video.setEnabled(True)
-            # 创建节点对象，用于访问和修改流缓冲区处理模式的参数
-            self.node_bufferhandling_mode = PySpin.CEnumerationPtr(self.sNodemap.GetNode('StreamBufferHandlingMode'))
-            if not PySpin.IsAvailable(self.node_bufferhandling_mode) or not PySpin.IsWritable(
-                    self.node_bufferhandling_mode):
-                print('Unable to set stream buffer handling mode.. Aborting...')
+            # 获取相机数量,这里只支持一个!
+            num_cameras = self.cam_list.GetSize()
+            if num_cameras != 0:
+                self.nodemap_tldevice = self.cam.GetTLDeviceNodeMap()#获取跟传输有关的属性
 
-            # 设置流缓冲区处理模式为最新模式
-            node_newestonly = self.node_bufferhandling_mode.GetEntryByName('NewestOnly')
-            if not PySpin.IsAvailable(node_newestonly) or not PySpin.IsReadable(node_newestonly):
-                print('Unable to set stream buffer handling mode.. Aborting...')
-            self.node_newestonly_mode = node_newestonly.GetValue()
+                deviceFeaturesInfo = PySpin.CCategoryPtr(self.nodemap_tldevice.GetNode('DeviceInformation')).GetFeatures()
+                self.modelName = PySpin.CValuePtr(deviceFeaturesInfo[3]).ToString()#相机型号
+                print(self.modelName[-1])
+                serialNum = PySpin.CValuePtr(deviceFeaturesInfo[1]).ToString()#相机序列号
+                self.cam.Init()
 
-            # 设置流缓冲区处理模式为最新模式，它使用之前获取的最新模式的整数值，作为流缓冲区处理模式枚举节点的新值。 这样，相机就会只保留最新的图像，而丢弃旧的图像。
-            self.node_bufferhandling_mode.SetIntValue(self.node_newestonly_mode)
+                self.nodemap = self.cam.GetNodeMap()#获取所有属性
 
-            #获取相机的设备序列号
-            node_device_serial_number = PySpin.CStringPtr(self.nodemap_tldevice.GetNode('DeviceSerialNumber'))
-            if PySpin.IsAvailable(node_device_serial_number) and PySpin.IsReadable(node_device_serial_number):
-                device_serial_number = node_device_serial_number.GetValue()
-                print('Device serial number retrieved as %s...' % device_serial_number)
+                # Set acquisition mode to continuous
+                node_acquisition_mode = PySpin.CEnumerationPtr(self.nodemap.GetNode('AcquisitionMode'))
+                if not PySpin.IsAvailable(node_acquisition_mode) or not PySpin.IsWritable(node_acquisition_mode):
+                    print('Unable to set acquisition mode to continuous (enum retrieval). Aborting...')
+                    return False
+                # Retrieve entry node from enumeration node
+                node_acquisition_mode_continuous = node_acquisition_mode.GetEntryByName('Continuous')
+                if not PySpin.IsAvailable(node_acquisition_mode_continuous) or not PySpin.IsReadable(
+                        node_acquisition_mode_continuous):
+                    print('Unable to set acquisition mode to continuous (entry retrieval). Aborting...')
+                    return False
 
-            #相机开始获取图像
-            self.cam.BeginAcquisition()
-            print('All initial finished,Begin to Acquisition')
+                acquisition_mode_continuous = node_acquisition_mode_continuous.GetValue()
+                node_acquisition_mode.SetIntValue(acquisition_mode_continuous)
+                print('Acquisition mode set to continuous...')
 
-            #获取实时fps
-            self.real_fps = self.cam.AcquisitionResultingFrameRate.GetValue()
+                # 获取相机版本型号
+                self.lb_video_inf.setText(self.modelName)
 
-            #相机初始化自动曝光
-            self.Reset_exposure()
+                # 使能按钮
+                self.btn_save_pictures.setEnabled(True)
+                self.btn_stop_save_pictures.setEnabled(True)
+                self.btn_auto_exposure.setEnabled(True)
+                self.btn_auto_gain.setEnabled(True)
+                self.ui.btn_stop_caputre.setEnabled(True)
+                self.lb_num_cam.setText('%d' % num_cameras)
+                self.btn_stop_capture_video.setEnabled(False)
+                self.btn_start_capture_video.setEnabled(True)
 
-            #相机初始化增益
-            self.Reset_gain()
+                if self.ui.lb_show_com.text() == 'Connected':
+                    self.ui.btn_autoSearch.setEnabled(True)
+                    self.ui.btn_autofocus.setEnabled(True)
 
-            #用定时器来获取新的图像
-            self.timer_video.start(0)
+                #相机开始获取图像
+                self.cam.BeginAcquisition()
+                print('All initial finished,Begin to Acquisition...')
 
-            # 用定时器来更新曝光时间显示的标签
-            self.exp_show_timer.start(0)
+                #获取实时fps
+                self.real_fps = self.cam.AcquisitionResultingFrameRate.GetValue()
 
-            # 用定时器来更新gain显示的标签
-            self.gain_show_timer.start(0)
+                #更新标签
+                self.update_exp_label()
+                self.update_gain_label()
 
-            # 用定时器来获取fps
-            self.fps_show_timer.start(0)
+                # 相机初始化自动曝光
+                self.Reset_exposure()
+                auto_exposure_value=self.cam.ExposureTime.GetValue()
+                self.exposure_time_slider.setValue(auto_exposure_value)
 
-            #关闭这个按钮，不然会报错
-            self.ui.btn_begin_caputre.setEnabled(False)
+                # 相机初始化增益
+                self.Reset_gain()
+                auto_gain_value = self.cam.Gain.GetValue()
+                self.ui.gain_control.setValue(auto_gain_value)
 
-            # 支持的曝光时间非常久，容易卡，这里手动设置为30000
-            self.exposure_time_slider.setRange(self.cam.ExposureTime.GetMin(), 30000)
+                #用定时器来获取新的图像
+                self.timer_video.start(0)
 
-            #设置增益的slider上下限
-            self.gain_slider.setRange(self.cam.Gain.GetMin(),self.cam.Gain.GetMax())
+                # 用定时器来更新曝光时间显示的标签
+                self.exp_show_timer.start(1000)
 
-            self.ui.btn_stop_save_2.setEnabled(False)
-            self.ui.btn_stop_save.setEnabled(False)
-        else:
+                # 用定时器来更新gain显示的标签
+                self.gain_show_timer.start(1000)
+
+                # 用定时器来获取fps
+                self.fps_show_timer.start(1000)
+
+                #关闭这个按钮，不然会报错
+                self.ui.btn_begin_caputre.setEnabled(False)
+
+                # 支持的曝光时间非常久，容易卡，这里手动设置为30000
+                self.exposure_time_slider.setRange(self.cam.ExposureTime.GetMin(), 30000)
+
+                #设置增益的slider上下限
+                self.gain_slider.setRange(self.cam.Gain.GetMin(),self.cam.Gain.GetMax())
+
+                self.ui.btn_stop_save_2.setEnabled(False)
+                self.ui.btn_stop_save.setEnabled(False)
+
+
+            else:
+                QMessageBox.information(self, "notice", 'Please check if the camera is connected')
+        except:
             QMessageBox.information(self, "notice", 'Please check if the camera is connected')
     #用于虚假关闭相机，其实还在
     def stop_capture(self):
         lb_video_inf = self.ui.video_inf
-        lb_video_inf.setText('End EndAcquisition!')
+        lb_video_inf.setText('EndAcquisition!')
         self.ui.video_num.setText('0')
         self.timer_video.stop()
         self.cam.EndAcquisition()
@@ -371,6 +463,8 @@ class MyWindow(QWidget):
         self.ui.btn_begin_save_2.setEnabled(False)
         self.ui.btn_stop_save.setEnabled(False)
         self.ui.btn_stop_save_2.setEnabled(False)
+        self.ui.btn_autoSearch.setEnabled(False)
+        self.ui.btn_autofocus.setEnabled(False)
 
         #关闭三个定时器，停止更新
         self.exp_show_timer.stop()
@@ -395,81 +489,104 @@ class MyWindow(QWidget):
 
     #用于定时器获取一张图像并显示出来
     def update_image(self):
-        #获取实时gain
-        real_gain=self.cam.Gain.GetValue()
-        self.real_gain = round(real_gain,3)
 
         # 根据实时曝光时间调整等待时间
-        timeout = 0
-        real_exp_time = self.cam.ExposureTime.GetValue()  # us
-        self.real_exp_time = real_exp_time
-
+        timeout = 1000
+        self.real_exp_time = self.cam.ExposureTime.GetValue()
         if self.cam.ExposureTime.GetAccessMode() == PySpin.RW or self.cam.ExposureTime.GetAccessMode() == PySpin.RO:
             # The exposure time is retrieved in µs so it needs to be converted to ms to keep consistency with the unit being used in GetNextImage
             timeout = (int)(self.real_exp_time / 1000 + 1000)
-        image_result = self.cam.GetNextImage(timeout)
 
-        #检查图像完整性
-        if image_result.IsIncomplete():
-            print('Image incomplete with image status %d ...' % image_result.GetImageStatus())
+        image_result_ori = self.cam.GetNextImage(timeout)
 
-        #格式转换
-        image_data_np = image_result.GetNDArray()
+        #判断是否是彩色相机,根据相机型号调整image_result
+        if self.modelName[-1]=='C':
+            image_result_color=image_result_ori.Convert(PySpin.PixelFormat_BGR8, PySpin.HQ_LINEAR)
+            image_data_np = image_result_color.GetNDArray()
+        elif self.modelName[-1]=='M':
+            image_result_mon=image_result_ori.Convert(PySpin.PixelFormat_Mono8, PySpin.HQ_LINEAR)
+            image_data_np = image_result_mon.GetNDArray()
+        else:
+            pass
+
+        # #检查完整性
+        # if image_result_ori.IsIncomplete():
+        #     print('Image incomplete with image status %d ...' % image_result_ori.GetImageStatus())
+
+        # 显示(灰度)
+        if self.modelName[-1] == 'M':
+            image_pixmap = QPixmap.fromImage(QImage(image_data_np.data, image_data_np.shape[1], image_data_np.shape[0],
+                                                    QImage.Format_Grayscale8))
+            self.img_show_lable.setPixmap(image_pixmap)
+            # 调整尺寸
+            self.img_show_lable.setScaledContents(True)
+
+        # 显示(RGB)
+        elif self.modelName[-1] == 'C':
+            image_pixmap = QPixmap.fromImage(QImage(image_data_np.data, image_data_np.shape[1], image_data_np.shape[0],
+                                                    QImage.Format_BGR888))
+            self.img_show_lable.setPixmap(image_pixmap)
+            # 调整尺寸
+            self.img_show_lable.setScaledContents(True)
+
 
         #如果同时需要保存下来,标志位由定时器控制,每x ms 置一次True,保存一张图片
         if self.need_save_fig == True:
             #开个子线程 保存图片 不然会拖慢进程 影响显示
             #判断是否手动选择了需要的格式，如果没有默认jpg
             format_need=self.ui.comboBox_output_format_2.currentText()
-            self.save_img_sub_thread=Save_img(data=image_data_np,path=self.pic_save_path,save_format=format_need)#todo 代码写了，但没有测试是否可以支持保存rgb
+
+            self.save_img_sub_thread=Save_img(data=image_result_ori,path=self.pic_save_path,save_format=format_need)
 
             self.need_save_fig=False#保存flag置为False,等待下一次置为True
+
         #如果需要录制下来
         if self.record_flag==True:
-            self.frameslist.append(image_result)
+            self.frameslist.append(image_result_ori)
 
-        #显示(灰度)
-        if len(image_data_np.shape) == 2:
-            image_pixmap = QPixmap.fromImage(QImage(image_data_np.data, image_data_np.shape[1], image_data_np.shape[0],
-                                                    QImage.Format_Grayscale8))
-            self.img_show_lable.setPixmap(image_pixmap)
-            # 调整尺寸
-            self.img_show_lable.setScaledContents(True)
-            # 释放内存
-            image_result.Release()
-        # 显示(RGB)
-        else:
-            image_pixmap = QPixmap.fromImage(QImage(image_data_np.data, image_data_np.shape[1], image_data_np.shape[0], QImage.Format_RGB888))#todo 代码写了，但没有测试是否可以支持rgb
-            self.img_show_lable.setPixmap(image_pixmap)
-            #调整尺寸
-            self.img_show_lable.setScaledContents(True)
-            #释放内存
-            image_result.Release()
+        #如果是在自动搜寻清晰的区域的上下平面
+        if self.cal_auto_search==True:
+            if len(image_data_np.shape) == 3:
+                gray = cv2.cvtColor(image_data_np, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image_data_np
+            gray=cv2.resize(gray,(800,550))
+            self.frame_list_cal.append(gray)
+            self.cal_auto_search=False
+        # 释放内存
+        image_result_ori.Release()
         return image_data_np
+
     #用于重置相机曝光模式到自动
     def Reset_exposure(self):
         if self.cam.ExposureAuto.GetAccessMode() != PySpin.RW:
             print('Unable to enable automatic exposure (node retrieval). Non-fatal error...')
-
         self.cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Continuous)
+
+        #启动定时器来检测实时的曝光值 并且同步到slider上
+        # self.exposure_time_slider.setValue(self.cam.ExposureTime.GetValue())
         print('Automatic exposure enabled...')
 
     #用于相机曝光时间修改
     def set_exposure(self):
+        self.cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
         if self.cam.ExposureTime.GetAccessMode() != PySpin.RW:
             print('Unable to set exposure time. Aborting...')
+
         exposure_time_to_set = self.exposure_time_slider.value()
         self.cam.ExposureTime.SetValue(exposure_time_to_set)
 
 
     # 用于更新曝光时间显示的标签
     def update_exp_label(self):
-        exp_time = self.real_exp_time
-        self.lb_exp_show.setText(str(exp_time))
+        # 获取实时曝光
+        self.real_exp_time = self.cam.ExposureTime.GetValue()# us
+        self.lb_exp_show.setText(str(self.real_exp_time))
 
     #用于相机曝光模式改变
     def change_exposure_mode(self):
         if self.btn_auto_exposure.isChecked():
+
             self.Reset_exposure()
             self.exposure_time_slider.setEnabled(False)
             self.exp_edit.setEnabled(False)
@@ -477,6 +594,7 @@ class MyWindow(QWidget):
 
         else:
             self.cam.ExposureAuto.SetValue(PySpin.ExposureAuto_Off)
+            self.cam.ExposureTime.SetValue(self.exposure_time_slider.value())
             self.exposure_time_slider.setEnabled(True)
             self.exp_edit.setEnabled(True)
             self.btn_exp_set.setEnabled(True)
@@ -492,24 +610,35 @@ class MyWindow(QWidget):
         # 自动gain关闭
         else:
             self.cam.GainAuto.SetValue(PySpin.GainAuto_Off)
+            self.cam.Gain.SetValue(self.gain_slider.value())
             self.gain_slider.setEnabled(True)
             self.gain_edit.setEnabled(True)
             self.btn_gain_set.setEnabled(True)
 
     #用于手动设置gain
     def set_gain(self):
+        if self.cam.Gain.GetAccessMode() != PySpin.RW:
+            print('Unable to set gain. Aborting...')
+        self.cam.GainAuto.SetValue(PySpin.GainAuto_Off)
         gain_to_set = self.gain_slider.value()
         self.cam.Gain.SetValue(gain_to_set)
 
     # 用于gain显示的标签
     def update_gain_label(self):
-        gain_num = self.real_gain
-        self.lb_gain_show.setText(str(gain_num))
+        # 获取实时曝光
+        self.real_gain = self.cam.Gain.GetValue()  # us
+        self.lb_gain_show.setText(str(self.real_gain))
+
+
 
     # 用于重置相机gain模式到自动
     def Reset_gain(self):
+        if self.cam.Gain.GetAccessMode() != PySpin.RW:
+            print('Unable to enable automatic exposure (node retrieval). Non-fatal error...')
         self.cam.GainAuto.SetValue(PySpin.GainAuto_Continuous)
         print('Automatic gain enabled...')
+        # self.gain_slider.setValue(self.cam.Gain.GetValue())
+
 
     #检查手动输入的曝光值是否是数字 是否在范围内,如果为空不判断
     def check_edit_exp(self):
@@ -565,18 +694,23 @@ class MyWindow(QWidget):
         #停止后说明保存结束，下次也从img1开始保存
         global flag_save_number
         flag_save_number=1
+
         #关闭定时器，关闭保存
         self.img_save_timer.stop()
         self.need_save_fig=False
         QMessageBox.information(self, "notice", 'All pictures have been saved in {}'.format(self.pic_save_path))
         self.ui.btn_stop_save.setEnabled(False)
         self.ui.label_show_save_inf.setText('Not Working')
+        #flag表示相机已经关闭
+        global flag_cam_is_on
+        flag_cam_is_on = False
     # 用于创建透镜子类，控制透镜
     def create_len(self):
         try:
             self.lens = Lens(self.ui.comboBox_port.currentText(), debug=False)
+
             if self.lens.comNum == 0:
-                QMessageBox.information(self,'Notice', u'The connection has failed, please enter the correct port number and check if the hardware device is plugged in')
+                QMessageBox.information(self,'Notice', u'Connection failed, please enter the correct port number and check if the hardware device is plugged in, or just retry！')
 
             elif self.lens.comNum == 1:
                 #状态显示
@@ -605,8 +739,36 @@ class MyWindow(QWidget):
                 self.ui.btn_Reset_diopter.setEnabled(True)
                 self.ui.btn_cycle_diopter.setEnabled(True)
                 self.ui.btn_stop_cycle_diopter.setEnabled(True)
+                if self.ui.video_num.text()=='1':
+                    self.ui.btn_autoSearch.setEnabled(True)
+                    self.ui.btn_autofocus.setEnabled(True)
+                # 获取连接上的端口号
+                self.port_checked = self.ui.comboBox_port.currentText()
+
+                self.timer_port.start(1000)
+
         except:
             QMessageBox.critical(self, 'Notice', 'The com is not available or the driver is not installed')
+
+    # 用于把透镜的屈光度设到输入的某一值
+    def set_constant_diopter(self,input):
+        if self.lens.comNum == 1:
+            if is_number(input):
+                min_diop, max_diop = self.lens.to_focal_power_mode()
+                # 检查输入是否正确
+                if input <= max_diop and input >= min_diop:
+                    self.lens.set_diopter(input)
+                    self.ui.lb_diop_show_2.setText(str(self.lens.get_diopter()))
+                else:
+                    QMessageBox.information(self, 'Notice',
+                                            u'Please enter the correct diopter!Diopter value should be between {} and {}'.format(
+                                                min_diop, max_diop))
+            else:
+                QMessageBox.information(self, 'Notice',
+                                        u'Diopter should be number!')
+        else:
+            QMessageBox.information(self, 'Notice',
+                                    u'You have not connected a lens')
 
     # 用于把透镜的屈光度设到某一值
     def setdiopter(self):
@@ -617,7 +779,7 @@ class MyWindow(QWidget):
                 input_diopter=float(self.ui.diopter_input_edit.text())
                 min_diop, max_diop = self.lens.to_focal_power_mode()
                 # 检查输入是否正确
-                if input_diopter < max_diop and input_diopter > min_diop:
+                if input_diopter <= max_diop and input_diopter >= min_diop:
                     self.lens.set_diopter(input_diopter)
                     self.ui.lb_diop_show.setText(str(self.lens.get_diopter()))
                 else:
@@ -641,104 +803,54 @@ class MyWindow(QWidget):
     # 用于屈光度变化循环
     def begin_cycle(self):
         #检查是否连接到了透镜
-        if self.lens.comNum == 1:
-            try:
-                min_diop, max_diop = self.lens.to_focal_power_mode()
-                max_cycle = self.ui.max_diopter_input.text()
-                min_cycle = self.ui.min_diopter_input.text()
-                step = self.ui.step_diopter_input.text()
-                cycle = self.ui.cycle_diopter_input.text()
-                max_cycle = float(max_cycle)
-                min_cycle = float(min_cycle)
-                step = float(step)
-                #如果没有输入cycle，默认10s单程，防止崩溃
-                if cycle=='':
-                    cycle=10
-                else:
-                    cycle = float(cycle) #s
+        if self.port_checked!='':
+            min_diop, max_diop = self.lens.to_focal_power_mode()
+            max_cycle = self.ui.max_diopter_input.text()
+            min_cycle = self.ui.min_diopter_input.text()
+            step = self.ui.step_diopter_input.text()
+            cycle = self.ui.cycle_diopter_input.text()
+            max_cycle = float(max_cycle)
+            min_cycle = float(min_cycle)
+            step = float(step)
+            #如果没有输入cycle，默认10s单程，防止崩溃
+            if cycle=='':
+                cycle=10
+            else:
+                cycle = float(cycle) #s
+            save_check =self.ui.btn_save_pic_zoom.isChecked()
+            if save_check == True:
+                self.get_save_path()  # 创建文件夹并且设置保存路径到类对象中
+                # 计数器清0
+                global flag_save_number
+                flag_save_number = 1
 
-                #判断输入是否正确
-                if max_cycle < max_diop and min_cycle > min_diop:
-                    #flag表示需要进行循环
-                    self.cycle_flag = True
-                    self.ui.lb_show_zoom.setText('Zooming')
-                    # 判断是否同时需要保存图像
-                    save_check = self.ui.btn_save_pic_zoom.isChecked()  # bool
-                    # 计算需要跳的次数
-                    times = (max_cycle - min_cycle) / step
-                    # 计算每次调节需要间隔的时间
-                    every_time = (cycle * 1000) / times  # 计算出来的时间单位ms
-                    if save_check == True:
-                        self.get_save_path()  # 创建文件夹并且设置保存路径到类对象中
+            #判断输入是否正确
+            if max_cycle <= max_diop and min_cycle >= min_diop:
+                #flag表示需要进行循环
+                self.cycle_flag = True
+                self.ui.lb_show_zoom.setText('Zooming')
+                # 判断是否同时需要保存图像
+                save_check = self.ui.btn_save_pic_zoom.isChecked()  # bool
+                # 计算需要跳的次数
+                times = (max_cycle - min_cycle) / step +1
+                # 计算每次调节需要间隔的时间
+                every_time = (cycle * 1000) / times  # 计算出来的时间单位ms
+                fore_back=self.ui.btn_save_pic_zoom_2.isChecked()#是否需要来回
 
-                        #定时器拍照用，每隔every_time拍一次
-                        self.img_save_timer.start(every_time)
+                self.cycle_thread = Thread_cycle(save_check,fore_back,times,every_time,max_cycle,min_cycle,step)
 
-                        # 计数器清0
-                        global flag_save_number
-                        flag_save_number = 1
+                self.cycle_thread.change_diopter_signal.connect(self.set_constant_diopter)
+                if save_check == True:
+                    self.cycle_thread.save_signal.connect(self.cycly_save_img)
 
-                    #如果需要来回拍而不是从头拍到尾
-                    if not self.ui.btn_save_pic_zoom_2.isChecked():
-                        #从最大开始拍到最小
-                        real_diop = max_cycle
+                self.cycle_thread.start()
 
-                        for i in range(int(times)):
-                            if self.cycle_flag==False:
-                                # 停止保存图像
-                                self.img_save_timer.stop()
-                                break
-                            self.lens.set_diopter(real_diop)
-                            real_diop-=step
-                            time.sleep(every_time/1000)#time.sleep(s)
-                            # 获取当前屈光度并显示
-                            now_diop=self.lens.get_diopter()#获取屈光度
-                            self.ui.lb_diop_show_2.setText(str(now_diop))
-                            #防卡
-                            QApplication.processEvents()
-                        #停止保存图像
-                        self.img_save_timer.stop()
-                    #从头拍到尾
-                    else:
-                        # 先从最大开始拍到最小
-                        real_diop = max_cycle
-                        for i in range(int(times)):
-                            if self.cycle_flag==False:
-                                # 停止保存图像
-                                self.img_save_timer.stop()
-                                break
-                            self.lens.set_diopter(real_diop)
-                            real_diop-=step
-                            time.sleep(every_time/1000)#time.sleep(s)
-                            # 获取当前屈光度并显示
-                            now_diop=self.lens.get_diopter()#获取屈光度
-                            self.ui.lb_diop_show_2.setText(str(now_diop))
-                            QApplication.processEvents()
+                self.ui.lb_show_zoom.setText('Finish zooming')
 
-                        # 再从最小开始拍到最大,这里不重复拍所以先加上step
-                        real_diop = min_cycle+step
-                        for i in range(int(times)):
-                            if self.cycle_flag==False:
-                                # 停止保存图像
-                                self.img_save_timer.stop()
-                                break
-                            self.lens.set_diopter(real_diop)
-                            real_diop+=step
-                            time.sleep(every_time/1000)#time.sleep(s)
-                            # 获取当前屈光度并显示
-                            now_diop=self.lens.get_diopter()#获取屈光度
-                            self.ui.lb_diop_show_2.setText(str(now_diop))
-                            QApplication.processEvents()
-                        # 停止保存图像
-                        self.img_save_timer.stop()
-                    self.ui.lb_show_zoom.setText('Finish zooming')
-                else:
-                    QMessageBox.information(self, 'Notice',
-                                            u'Please enter the correct diopter!Diopter value should be between {} and {}'.format(
-                                                min_diop, max_diop))
-            except:
+            else:
                 QMessageBox.information(self, 'Notice',
-                                        u'You have not enter correct diopter and step!')
+                                        u'Please enter the correct diopter!Diopter value should be between {} and {}'.format(
+                                            min_diop, max_diop))
 
         else:
             QMessageBox.information(self, 'Notice',
@@ -746,7 +858,7 @@ class MyWindow(QWidget):
 
     # 用于停止屈光度变化循环
     def stop_cycle(self):
-        self.cycle_flag=False
+        self.cycle_thread.terminate()
 
 
     #用于计算cycle图像数量：
@@ -781,104 +893,97 @@ class MyWindow(QWidget):
     # 用于自动调焦
     def auto_focus(self):
         #检查透镜和相机连接是否已经连接
-        try:
-            #获取最大和最小屈光度
-            min_diop, max_diop = self.lens.to_focal_power_mode()
-            min_diop=float(min_diop)
-            max_diop=float(max_diop)
-            tol=0.1
+        # try:
+        #获取最大和最小屈光度
+        min_diop, max_diop = self.lens.to_focal_power_mode()
+        min_diop=float(min_diop)
+        max_diop=float(max_diop)
+        tol=0.1
 
+
+
+        self.ui.lb_show_focus_inf.setText('Focusing')
+        if self.ui.comboBox_focus_method.currentText() =='Trichotomy':
+            self.focus_thread=ternary_search_thread(min_diop, max_diop, tol)
+            self.focus_thread.callback.connect(self.set_and_cal_two_image)
+            self.focus_thread.result_signal.connect(self.get_best_diop)
+            self.focus_thread.finished.connect(self.autofocus_on_finished)
+            self.focus_thread.start()
+
+        elif self.ui.comboBox_focus_method.currentText()=='Climbing':
+            self.focus_thread = hill_climb_thread(min_diop, max_diop,step=0.1, max_iter=1000)
+            self.focus_thread.callback.connect(self.set_and_cal_one_image)
+            self.focus_thread.result_signal.connect(self.get_best_diop)
+            self.focus_thread.finished.connect(self.autofocus_on_finished)
+            self.focus_thread.start()
+
+        elif self.ui.comboBox_focus_method.currentText()=='Curve fitting':
+            self.focus_thread=curvefitting_thread(min_diop,max_diop)
+            self.focus_thread.callback.connect(self.set_and_cal_one_image)
+            self.focus_thread.result_signal.connect(self.get_best_diop)
+            self.focus_thread.finished.connect(self.autofocus_on_finished)
+            self.focus_thread.start()
+
+        # except:
+        #     QMessageBox.information(self, 'Notice',
+        #                             u'Please connect the camera, lens!')
+        # finally:
+        #     roi_flag == False
             # 定义一个函数fun(x)，这里假设它是单峰的
-            def fun(diop):
-                if self.lens.comNum == 1:
-                    #设置屈光度
-                    self.lens.set_diopter(diop)
-                    #获取当前屈光度
-                    current_diop=self.lens.get_diopter()
-                    #设置的值和获取的值误差小于tol,说明设置成功，再计算清晰度
-                    if abs(current_diop-diop)<=0.01:
 
-                        #非ROI
-                        global roi_flag
-                        if roi_flag==False:
-                            out = cal_clarity(self.update_image(), measure=self.ui.comboBox_focus_measure.currentText(),
-                                              roi_point=None, label_height=None, roi_height=None,roi_width=None)
-                        #局部自动对焦
-                        else:
-                            # 用于计算实际像素画面与label的比例
-                            self.label_height = self.ui.video_label.height()
-                            out = cal_clarity(self.update_image(), measure=self.ui.comboBox_focus_measure.currentText(),
-                                            roi_point=self.roi_point,label_height=self.label_height,roi_height=self.roi_height,roi_width=self.roi_width)
-                    #设置没有成功,加大时间延迟给透镜
-                    else:
-                        print('Diopter setting failure')
-                        self.lens.set_diopter(diop)
-                        time.sleep(0.1)
+    #收到变焦结束信号后，设置到最佳屈光度
+    def autofocus_on_finished(self):
+        self.lens.set_diopter(self.best_diop)
+        self.ui.lb_show_focus_inf.setText('Finish')
+        self.ui.lb_diop_show.setText(str(round(self.best_diop,2)))
 
+    #设置到diop屈光度并且计算清晰度
+    def set_and_cal_one_image(self, diop):
+        if self.lens.comNum == 1:
+            # 设置屈光度
+            self.lens.set_diopter(diop)
+            # 获取当前屈光度
+            current_diop = self.lens.get_diopter()
+            # 设置的值和获取的值误差小于tol,说明设置成功，再计算清晰度
+            if abs(current_diop - diop) <= 0.01:
+                # 非ROI
+                global roi_flag
+                if roi_flag == False:
+                    out = cal_clarity(self.update_image(), measure=self.ui.comboBox_focus_measure.currentText(),
+                                      roi_point=None, label_height=None, roi_height=None, roi_width=None)
+                # 局部自动对焦
                 else:
-                    QMessageBox.information(self, 'Notice',
-                                            u'You have not connected a lens')
-                return out
-            # 定义一个三分法的函数，输入是区间[a,b]和精度eps
-            def ternary_search(a, b, eps):
-                # 当区间长度小于eps时，停止循环
-                while b - a > eps:
-                    # 计算两个分割点
-                    m1 = a + (b - a) / 3
-                    m2 = b - (b - a) / 3
-                    # 比较函数值，判断最大值在哪个区间内
-                    if fun(m1) < fun(m2):
-                        # 最大值在[m1, b]内，舍弃[a, m1]区间
-                        a = m1
-                    else:
-                        # 最大值在[a, m2]内，舍弃[m2, b]区间
-                        b = m2
-                # 返回区间中点作为最大值的近似解
-                return (a + b) / 2
+                    # 用于计算实际像素画面与label的比例
+                    self.label_height = self.ui.video_label.height()
+                    out = cal_clarity(self.update_image(), measure=self.ui.comboBox_focus_measure.currentText(),
+                                      roi_point=self.roi_point, label_height=self.label_height,
+                                      roi_height=self.roi_height, roi_width=self.roi_width)
+            # 设置没有成功,加大时间延迟给透镜
+            else:
+                print('Diopter setting failure')
+                self.lens.set_diopter(diop)
+                time.sleep(0.2)
 
-            def hill_climb(min, max, step=0.1, max_iter=1000):
-                x = np.random.uniform(min, max)
-                for i in range(max_iter):
-                    curr_val = fun(x)
-                    next_x = x + np.random.uniform(-step, step)
-                    next_val = fun(next_x)
-                    if next_val > curr_val:
-                        x, curr_val = next_x, next_val
-                return x
-            def curvefitting(min,max):
-                # x和y数据
-                step=0.1
-                x = np.arange(min,max,step)
-                #随机生成y，用于更新
-                y = np.arange(min, max, step)
-                #计算y
-                for val in range(x.shape[0]):
-                    y[val]=fun(val)
-                # 需要拟合的二次函数
-                def func(x, a, b, c):
-                    return a*x*x+b*x+c
-                popt, pcov = curve_fit(func, x, y)
-                a,b,c=popt
-                #求y最大值时候的x
-                x=max_y(a,b,c,min_diop,max_diop)
-                return x
-
-            self.ui.lb_show_focus_inf.setText('Focusing')
-            if self.ui.comboBox_focus_method.currentText() =='Trichotomy':
-                best_diop = ternary_search(min_diop, max_diop, tol)
-            elif self.ui.comboBox_focus_method.currentText()=='Climbing':
-                best_diop = hill_climb(min_diop,max_diop,step=0.1,max_iter=1000)
-            elif self.ui.comboBox_focus_method.currentText()=='Curve fitting':
-                best_diop=curvefitting(min_diop,max_diop)
-            self.lens.set_diopter(best_diop)
-            self.ui.lb_show_focus_inf.setText('Finish')
-            self.ui.lb_diop_show.setText(str(round(best_diop,2)))
-
-        except:
+        else:
             QMessageBox.information(self, 'Notice',
-                                    u'Please connect the camera, lens!')
-        finally:
-            roi_flag == False
+                                    u'You have not connected a lens')
+        # 发射数据给曲线拟合的线程
+        if self.ui.comboBox_focus_method.currentText()=='Curve fitting':
+            self.focus_thread.data_signal1.emit(out)
+        # 发射数据给爬山算法的线程
+        if self.ui.comboBox_focus_method.currentText() == 'Climbing':
+            self.focus_thread.data_signal1.emit(out)
+        return out
+
+    # 设置两个并发送两个结果
+    def set_and_cal_two_image(self,data):
+        diop1,diop2=data
+        self.focus_result1 = self.set_and_cal_one_image(diop1)
+        self.focus_result2 = self.set_and_cal_one_image(diop2)
+        self.focus_thread.data_signal1.emit(self.focus_result1)
+        self.focus_thread.data_signal2.emit(self.focus_result2)
+    def get_best_diop(self,data):
+        self.best_diop=data
     #开始录像
     def start_recording(self):
         if self.cam_list.GetSize()!=0:
@@ -1001,6 +1106,169 @@ class MyWindow(QWidget):
         self.draw_rect = QRect()
         self.update()
 
+    #用于自动找到聚焦的上下平面
+    def auto_search(self):
+        # 检查是否连接到了透镜
+        if self.port_checked!='':
+            try:
+                self.diop_list=[]
+                min_diop, max_diop = self.lens.to_focal_power_mode()
+                max_cycle = max_diop
+                min_cycle = min_diop
+                step = 0.1#步距
+                cycle = float(10.0)#设定总时间
+                max_cycle = float(max_cycle)
+                min_cycle = float(min_cycle)
+                step = float(step)#设定步距
+                # 计算需要跳的次数
+                times = (max_cycle - min_cycle) / step +1
+                # 计算每次调节需要间隔的时间
+                every_time = (cycle * 1000) / times  # 计算出来的时间单位ms
+
+                self.ui.lb_show_zoom.setText('Searching')
+
+                #开启变焦子线程
+                self.search_thread=Thread_search(times,every_time,max_cycle,min_cycle,step)
+                #绑定变焦函数
+                self.search_thread.change_diopter_signal.connect(self.set_constant_diopter)
+                #绑定添加图片到列表的函数
+                self.search_thread.add_frame_signal.connect(self.add_frame2list)
+                #绑定label显示的函数
+                self.search_thread.search_state_signal.connect(self.lable2finish)
+                #绑定接受屈光度列表的函数
+                self.search_thread.add_diopter_list_signal.connect(self.add_diop_list)
+                #绑定变焦完后 开始计算清晰度的函数
+                self.search_thread.start_to_cal_clarity_signal.connect(self.cal_frame_list_clarity)
+
+                self.search_thread.start()
+
+
+            except Exception as e:
+                print(e)
+                QMessageBox.information(self, 'Notice',
+                                        u'You have not enter correct diopter and step!')
+
+        else:
+            QMessageBox.information(self, 'Notice',
+                                    u'You have not connected a lens')
+    #变焦完成,计算列表清晰度
+    def cal_frame_list_clarity(self):
+        print(self.frame_list_cal)
+        print(self.diop_list)
+    #得到屈光度列表
+    def add_diop_list(self,diop):
+        self.diop_list.append(diop)
+
+    #自动寻找焦平面的标签
+    def lable2finish(self,flag):
+        if flag==False:
+            self.ui.lb_show_zoom.setText('Finish Searching')
+        else:
+            self.ui.lb_show_zoom.setText('Zooming')
+    #用于融合图像栈的按钮
+    def fusion_stack(self):
+
+        stack_path = self.ui.edit_fusion_path.text()
+        result_path = self.ui.edit_fusion_result_path.text()
+        is_valid_scale=is_scale_valid(self.ui.edit_scale.text())
+        use_gpu_check_box=self.ui.btn_use_GPU.isChecked()
+
+        #判断文件夹中的图片是否都是数字名字
+        if is_valid_scale:
+            # 判断是否都是正确的文件夹路径
+            if os.path.isdir(stack_path) and os.path.isdir(result_path):
+                try:
+                    img_formats = {'.jpg', '.png', '.bmp'}
+                    existing_formats = set()
+                    #检索存在的图片格式，#需要整个文件夹的图片都是统一格式的图片
+                    for root, dirs, files in os.walk(stack_path):
+                        for file in files:
+                            ext = os.path.splitext(file)[1].lower()
+                            existing_formats.add(ext)
+                    if len(existing_formats)==1:
+                        if existing_formats & img_formats:
+                            #判断图片名字是否全是数字
+                            for filename in os.listdir(stack_path):
+                                is_number_named=True
+                                if not re.match(r'^\d+.jpg$', filename):
+                                    is_number_named = False
+                                else:
+                                    pass
+                            if is_number_named==True:
+                                [source_format] = existing_formats
+                                #如果真的可以用gpu,就用gpu
+                                if gpu_is_available()&use_gpu_check_box:
+                                    use_gpu_in_fact=True
+                                #如果不可以用
+                                else:
+                                    use_gpu_in_fact=False
+                                    if use_gpu_check_box==True:
+                                        QMessageBox.information(self, 'Notice',
+                                                                u'No GPU found, use CPU instead.')
+                                    else:
+                                        pass
+
+                                fusion_thread=fusion.Fusion_stack(stack_path,result_path=result_path,
+                                                    source_format=source_format,
+                                                    save_format=self.ui.comboBox_output_format_4.currentText(),
+                                                    Using_Optimised_Processing=self.ui.btn_use_filter.isChecked(),
+                                                    image_scale=0.01*int(self.ui.edit_scale.text()),
+                                                    use_gpu=use_gpu_in_fact)
+
+
+                                QMessageBox.information(self, 'Notice',
+                                                        u'{}'.format(fusion_thread.result_path_and_time))
+
+
+                            else:
+                                QMessageBox.information(self, 'Notice',
+                                                        u'Images need to be named in numerical order, e.g. 1.jpg, 2.jpg...')
+                        else:
+                            QMessageBox.information(self, 'Notice',
+                                                    u'Only support jpg,png,bmp image format')
+                    else:
+                        QMessageBox.information(self, 'Notice',
+                                                u'There are multiple formats of images in the folder, currently only supports all images in the same format')
+
+
+                except Exception as e:
+                    QMessageBox.information(self, 'Notice',
+                                            u'Fusion failed, {}'.format(str(e)))
+            else:
+                QMessageBox.information(self, 'Notice',
+                                        u'You have not enter a correct path')
+        else:
+            QMessageBox.information(self, 'Notice',
+                                    u'Scale needs to be between 1-100')
+
+    # 用于选取融合图像栈的路径
+    def browse_stack_dir(self):
+        img_stack_path=QFileDialog.getExistingDirectory(self, "Please select the folder path where the image stack is located")
+
+        if img_stack_path:
+            self.ui.edit_fusion_path.setText(img_stack_path)
+
+        else:
+            QMessageBox.information(self, 'Notice',
+                                    u'You have not selected path')
+
+
+    # 用于选取融合图像栈保存的路径
+    def browse_fusion_result_dir(self):
+        fusion_result_save_path=QFileDialog.getExistingDirectory(self, "Please select the folder path where the image stack is located")
+        if fusion_result_save_path:
+            self.ui.edit_fusion_result_path.setText(fusion_result_save_path)
+        else:
+            QMessageBox.information(self, 'Notice',
+                                    u'You have not selected path')
+
+    # 变焦循环过程中的保存flag，flag来自于信号
+    def cycly_save_img(self, flag):
+        self.need_save_fig = flag
+
+    #寻找焦平面过程中的保存flag，flag来自于信号
+    def add_frame2list(self, flag):
+        self.cal_auto_search=flag
 #子线程用来保存图片，不影响主线程显示
 class Save_img(QThread):
     def __init__(self,data,path,save_format):
@@ -1011,8 +1279,235 @@ class Save_img(QThread):
     # 重写run方法
     def save(self):
         global flag_save_number#定义在文件头
-        cv2.imwrite(os.path.join(self.path,str(flag_save_number)+ self.save_format), self.data)
+        self.data.Save(os.path.join(self.path,str(flag_save_number)+ self.save_format))
         print('{}{} has been saved in {}'.format(flag_save_number,self.save_format,self.path + '/'+str(flag_save_number)+'%s'%self.save_format))
         flag_save_number += 1#增量式创建，图片按先后排序
 
+class Thread_cycle(QThread):
+    # 创建信号，发送str类型数据
+    save_signal = pyqtSignal(bool)
+    change_diopter_signal=pyqtSignal(float)
+    def __init__(self,save_check,check_front_back,times,every_time,max_cycle,min_cycle,step):
+        super().__init__()
+        self.save_check=save_check
+        self.times=times
+        self.every_time=every_time
+        self.max_cycle=max_cycle
+        self.min_cycle=min_cycle
+        self.step=step
+        self.check_front_back=check_front_back
 
+    def run(self):
+        # 从最大开始拍到最小
+        if not self.check_front_back:
+            self.real_diop = self.max_cycle
+
+            for i in range(int(self.times)):
+                self.change_diopter_signal.emit(self.real_diop)
+                # 等待变焦
+                time.sleep(0.2)
+                self.save_signal.emit(self.save_check)
+                # 等待保存
+                time.sleep(0.2)
+                self.real_diop -= self.step
+                time.sleep(self.every_time / 1000)  # time.sleep(s)
+                # 防卡
+                QApplication.processEvents()
+
+        # 来回拍
+        else:
+            # 先从最大开始拍到最小
+            self.real_diop = self.max_cycle
+            for i in range(int(self.times)):
+                self.change_diopter_signal.emit(str(self.real_diop))
+
+                self.save_signal.emit(self.save_check)
+
+                self.real_diop -= self.step
+                time.sleep(self.every_time / 1000)  # time.sleep(s)
+
+                QApplication.processEvents()
+
+            # 再从最小开始拍到最大,这里不重复拍所以先加上step
+            self.real_diop = self.min_cycle + self.step
+            for i in range(int(self.times)):
+
+                self.change_diopter_signal.emit(str(self.real_diop))
+                self.save_signal.emit(self.save_check)
+
+                self.real_diop += self.step
+                time.sleep(self.every_time / 1000)  # time.sleep(s)
+                QApplication.processEvents()
+
+class Thread_search(QThread):
+    # 创建信号，发送str类型数据
+    change_diopter_signal=pyqtSignal(float)
+    add_frame_signal=pyqtSignal(bool)
+    search_state_signal=pyqtSignal(bool)
+    start_to_cal_clarity_signal=pyqtSignal(bool)
+    add_diopter_list_signal=pyqtSignal(float)
+
+    def __init__(self,times,every_time,max_cycle,min_cycle,step):
+        super().__init__()
+        self.times=times
+        self.every_time=every_time
+        self.max_cycle=max_cycle
+        self.min_cycle=min_cycle
+        self.step=step
+
+    def run(self):
+        # 从最大开始拍到最小
+        self.real_diop = self.max_cycle
+        self.search_state_signal.emit(True)
+        self.start_to_cal_clarity_signal.emit(False)
+
+        for i in range(int(self.times)):
+            self.change_diopter_signal.emit(self.real_diop)
+            self.add_diopter_list_signal.emit(self.real_diop)
+            # 等待变焦
+            time.sleep(0.2)
+
+            self.add_frame_signal.emit(True)
+            # 等待保存
+            time.sleep(0.2)
+
+            self.real_diop -= self.step
+            time.sleep(self.every_time / 1000)  # time.sleep(s)
+            QApplication.processEvents()
+        self.search_state_signal.emit(False)
+        self.start_to_cal_clarity_signal.emit(True)
+
+
+class ternary_search_thread(QThread):
+    callback = pyqtSignal(tuple)
+    data_signal1 = pyqtSignal(float)
+    data_signal2 = pyqtSignal(float)
+    result_signal = pyqtSignal(float)
+    def __init__(self,min_diop, max_diop, tol):
+        super().__init__()
+        self.min_diop=min_diop
+        self.max_diop=max_diop
+        self.tol=tol
+
+    def run(self):
+        self.data_signal1.connect(self.on_signal1)
+        self.data_signal2.connect(self.on_signal2)
+
+        # 定义一个函数fun(x)，这里假设它是单峰的
+        def ternary_search(a, b, eps):
+            # 当区间长度小于eps时，停止循环
+            while b - a > eps:
+                # 计算两个分割点
+
+                m1 = a + (b - a) / 3
+                m2 = b - (b - a) / 3
+                # 比较函数值，判断最大值在哪个区间内
+                send=(m1,m2)
+                self.callback.emit(send)
+                time.sleep(1)#等待计算一秒，配置差可能要增大不然会报错
+                fun1_result=self.fun1_result
+                fun2_result=self.fun2_result
+                if fun1_result < fun2_result:
+                    # 最大值在[m1, b]内，舍弃[a, m1]区间
+                    a = m1
+                else:
+                    # 最大值在[a, m2]内，舍弃[m2, b]区间
+                    b = m2
+            # 返回区间中点作为最大值的近似解
+            return (a + b) / 2
+
+        self.result=ternary_search(self.min_diop,self.max_diop,self.tol)
+        self.result_signal.emit(self.result)
+
+
+    def on_signal1(self, float):
+        self.fun1_result=float
+
+    def on_signal2(self, float):
+        self.fun2_result=float
+
+#曲线拟合自动对焦子线程
+class curvefitting_thread(QThread):
+    callback = pyqtSignal(float)
+    data_signal1 = pyqtSignal(float)
+
+    result_signal = pyqtSignal(float)
+
+    def __init__(self, min_diop, max_diop):
+        super().__init__()
+        self.min_diop = min_diop
+        self.max_diop = max_diop
+
+
+    def run(self):
+        self.data_signal1.connect(self.on_signal1)
+
+        def curvefitting(min,max):
+            # x和y数据
+            step=0.1
+            x = np.arange(min,max,step)
+            x_list=x.tolist()
+            #随机生成y，用于更新
+            y = np.arange(min, max, step)
+            #计算y
+            for val_index,val in enumerate(x_list):
+
+                self.callback.emit(val)
+                time.sleep(0.5)#等待计算一秒，配置差可能要增大不然会报错
+                fun1_result = self.fun1_result
+                y[val_index]=fun1_result
+            # 需要拟合的二次函数
+            def func(x, a, b, c):
+                return a*x*x+b*x+c
+            popt, pcov = curve_fit(func, x, y)
+
+            a,b,c=popt
+            #求y最大值时候的x
+            x=max_y(a,b,c,self.min_diop,self.max_diop)
+            return x
+
+        self.result = curvefitting(self.min_diop, self.max_diop)
+        self.result_signal.emit(self.result)
+
+    def on_signal1(self, float):
+        self.fun1_result = float
+
+#爬山子线程
+class hill_climb_thread(QThread):
+    callback = pyqtSignal(float)
+    data_signal1 = pyqtSignal(float)
+    result_signal = pyqtSignal(float)
+
+    def __init__(self, min_diop, max_diop,step, max_iter):
+        super().__init__()
+        self.min_diop = min_diop
+        self.max_diop = max_diop
+        self.step=step
+        self.max_iter=max_iter
+
+    def run(self):
+        self.data_signal1.connect(self.on_signal1)
+
+        def hill_climb(min, max,step, max_iter):
+            x = np.random.uniform(min, max)
+            print(x)
+            for i in range(max_iter):
+                self.callback.emit(x)
+                time.sleep(0.5)  # 等待计算一秒，配置差可能要增大不然会报错
+                curr_val = self.fun1_result
+
+                next_x = x + np.random.uniform(-step, step)
+                self.callback.emit(next_x)
+                time.sleep(0.5)  # 等待计算一秒，配置差可能要增大不然会报错
+                next_val = self.fun1_result
+                print(next_val,curr_val)
+                if next_val > curr_val:
+                    x, curr_val = next_x, next_val
+            return x
+
+
+        self.result = hill_climb(self.min_diop, self.max_diop,self.step, self.max_iter)
+        self.result_signal.emit(self.result)
+
+    def on_signal1(self, float):
+        self.fun1_result = float

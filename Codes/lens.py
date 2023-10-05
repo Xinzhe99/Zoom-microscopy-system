@@ -32,7 +32,8 @@ class Lens:
             if self.debug:
                 print('=== Lens initialization complete ==================================================================')
 
-
+    def close_connection(self):
+        self.connection.close()
 
     def send_command(self, command, reply_fmt=None):
         if type(command) is not bytes:

@@ -259,3 +259,11 @@ def max_y(a: float, b: float, c: float, x_min: float, x_max: float) -> float:
                 return x_min
             else:
                 return x_max
+#数字在1-100之间
+def is_scale_valid(image_scale):
+  pattern = r"^([1-9][0-9]?|100)$"
+  result = re.match(pattern, image_scale)
+  if result:
+    return True
+  else:
+    return False
